@@ -1,13 +1,15 @@
+import axios from "axios";
 import { buildFullAddress } from "../../common/utils/address.js";
-import { getPrimaryAddressRecord } from "../../common/utils/contact.utils.js";
-import {
-  searchContactsByFilters,
-  searchContactsPage,
-  searchDuplicateByField
-} from "../../common/integrations/ghl/ghl-client.js";
 
+const GHL_BASE_URL = process.env.GHL_BASE_URL || "https://services.leadconnectorhq.com";
+const GHL_VERSION = "2021-07-28";
+const REQUEST_TIMEOUT_MS = 15000;
 const CONTACT_PAGE_LIMIT = 100;
 const MAX_CONTACT_SEARCH_PAGES = 50;
+
+function toErrorMessage(error, fallback = "Unknown GHL error") {
+  return error?.response?.data?.message || error?.message || fallback;
+}
 
 function normalizeValue(value) {
   return String(value || "").trim().toLowerCase();
@@ -43,6 +45,14 @@ function isEquivalentAddress(candidate, target) {
   }
 
   return buildTokenFingerprint(candidate) === buildTokenFingerprint(target);
+}
+
+function getPrimaryAddressRecord(contact = {}) {
+  if (Array.isArray(contact?.addresses) && contact.addresses.length > 0) {
+    return contact.addresses[0] || {};
+  }
+
+  return {};
 }
 
 function getStreetAddress(contact = {}) {
@@ -90,42 +100,189 @@ function isCityMatch(contact, target) {
   return normalizeValue(getCity(contact)) === targetCity;
 }
 
+function extractContacts(searchResponseData) {
+  if (Array.isArray(searchResponseData?.contacts)) {
+    return searchResponseData.contacts;
+  }
+
+  if (Array.isArray(searchResponseData?.data?.contacts)) {
+    return searchResponseData.data.contacts;
+  }
+
+  if (Array.isArray(searchResponseData?.results)) {
+    return searchResponseData.results;
+  }
+
+  return [];
+}
+
+function extractSingleContact(duplicateResponseData) {
+  if (duplicateResponseData?.contact) {
+    return duplicateResponseData.contact;
+  }
+
+  if (duplicateResponseData?.data?.contact) {
+    return duplicateResponseData.data.contact;
+  }
+
+  return null;
+}
+
+function buildSearchPayload(criteria) {
+  return {
+    locationId: criteria.locationId,
+    page: criteria.page || 1,
+    pageLimit: criteria.pageLimit || CONTACT_PAGE_LIMIT,
+    filters: criteria.filters
+  };
+}
+
+function buildGetAllContactsPayload(criteria) {
+  return {
+    locationId: criteria.locationId,
+    page: criteria.page,
+    pageLimit: criteria.pageLimit,
+    ...(criteria.query ? { query: criteria.query } : {})
+  };
+}
+
+export class GhlServiceError extends Error {
+  constructor(message, statusCode = 502) {
+    super(message);
+    this.name = "GhlServiceError";
+    this.statusCode = statusCode;
+  }
+}
+
+async function runDuplicateLookup({ apiKey, locationId, fieldKey, fieldValue }) {
+  const endpoint = `${GHL_BASE_URL}/contacts/search/duplicate`;
+
+  try {
+    const response = await axios.get(endpoint, {
+      timeout: REQUEST_TIMEOUT_MS,
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        Version: GHL_VERSION
+      },
+      params: {
+        locationId,
+        [fieldKey]: fieldValue
+      }
+    });
+
+    return response.data;
+  } catch (error) {
+    if (error.response) {
+      console.error("[duplicate-contact] GHL response error", {
+        status: error.response.status,
+        locationId,
+        fieldKey,
+        message: toErrorMessage(error)
+      });
+      throw new GhlServiceError("Failed to fetch contacts from GHL", 502);
+    }
+
+    if (error.request) {
+      console.error("[duplicate-contact] GHL network error", {
+        locationId,
+        fieldKey,
+        message: error.message
+      });
+      throw new GhlServiceError("Network error while contacting GHL API", 502);
+    }
+
+    console.error("[duplicate-contact] Unexpected GHL service error", {
+      locationId,
+      fieldKey,
+      message: error.message
+    });
+    throw new GhlServiceError("Unexpected error while contacting GHL API", 500);
+  }
+}
+
 export async function searchDuplicateContactByPhoneEmail(criteria) {
   const tasks = [];
 
   if (criteria.phone) {
     tasks.push(
-      searchDuplicateByField({
+      runDuplicateLookup({
         apiKey: criteria.apiKey,
         locationId: criteria.locationId,
         fieldKey: "number",
         fieldValue: criteria.phone
-      }).then((result) => ({ field: "phone", result }))
+      }).then((data) => ({ field: "phone", data }))
     );
   }
 
   if (criteria.email) {
     tasks.push(
-      searchDuplicateByField({
+      runDuplicateLookup({
         apiKey: criteria.apiKey,
         locationId: criteria.locationId,
         fieldKey: "email",
         fieldValue: criteria.email
-      }).then((result) => ({ field: "email", result }))
+      }).then((data) => ({ field: "email", data }))
     );
   }
 
   const results = await Promise.all(tasks);
 
-  const phoneResult = results.find((item) => item.field === "phone")?.result || null;
-  const emailResult = results.find((item) => item.field === "email")?.result || null;
+  const phoneData = results.find((item) => item.field === "phone")?.data || null;
+  const emailData = results.find((item) => item.field === "email")?.data || null;
 
   return {
-    phoneData: phoneResult?.data || null,
-    emailData: emailResult?.data || null,
-    phoneContact: phoneResult?.contact || null,
-    emailContact: emailResult?.contact || null
+    phoneData,
+    emailData,
+    phoneContact: extractSingleContact(phoneData),
+    emailContact: extractSingleContact(emailData)
   };
+}
+
+async function searchContacts(criteria, filters, logPrefix) {
+  const payload = buildSearchPayload({
+    locationId: criteria.locationId,
+    filters
+  });
+  const endpoint = `${GHL_BASE_URL}/contacts/search`;
+
+  try {
+    const response = await axios.post(endpoint, payload, {
+      timeout: REQUEST_TIMEOUT_MS,
+      headers: {
+        Authorization: `Bearer ${criteria.apiKey}`,
+        Version: GHL_VERSION,
+        "Content-Type": "application/json"
+      }
+    });
+
+    return extractContacts(response.data);
+  } catch (error) {
+    if (error.response) {
+      console.error(`[${logPrefix}] GHL response error`, {
+        status: error.response.status,
+        locationId: criteria.locationId,
+        message: toErrorMessage(error)
+      });
+
+      throw new GhlServiceError("Failed to fetch contacts from GHL", 502);
+    }
+
+    if (error.request) {
+      console.error(`[${logPrefix}] GHL network error`, {
+        locationId: criteria.locationId,
+        message: error.message
+      });
+
+      throw new GhlServiceError("Network error while contacting GHL API", 502);
+    }
+
+    console.error(`[${logPrefix}] Unexpected GHL service error`, {
+      locationId: criteria.locationId,
+      message: error.message
+    });
+
+    throw new GhlServiceError("Unexpected error while contacting GHL API", 500);
+  }
 }
 
 export async function searchContactsByBusinessName(criteria) {
@@ -142,12 +299,7 @@ export async function searchContactsByBusinessName(criteria) {
     businessName: criteria.businessName
   });
 
-  const contacts = await searchContactsByFilters({
-    apiKey: criteria.apiKey,
-    locationId: criteria.locationId,
-    filters
-  });
-
+  const contacts = await searchContacts(criteria, filters, "duplicate-business-name");
   const exactMatches = contacts.filter((contact) =>
     isExactBusinessNameMatch(contact, criteria.businessName)
   );
@@ -159,23 +311,6 @@ export async function searchContactsByBusinessName(criteria) {
   });
 
   return exactMatches;
-}
-
-export async function getAllContacts(criteria) {
-  console.info("[get-all-contacts] GHL search request", {
-    locationId: criteria.locationId,
-    page: criteria.page,
-    pageLimit: criteria.pageLimit,
-    hasQuery: Boolean(criteria.query)
-  });
-
-  return searchContactsPage({
-    apiKey: criteria.apiKey,
-    locationId: criteria.locationId,
-    page: criteria.page,
-    pageLimit: criteria.pageLimit,
-    query: criteria.query
-  });
 }
 
 export async function searchContactsByAddress(criteria) {
@@ -257,4 +392,64 @@ export async function searchContactsByAddress(criteria) {
     cityMatches,
     addressMatches
   };
+}
+
+export async function getAllContacts(criteria) {
+  const payload = buildGetAllContactsPayload(criteria);
+  const endpoint = `${GHL_BASE_URL}/contacts/search`;
+
+  console.info("[get-all-contacts] GHL search request", {
+    locationId: criteria.locationId,
+    page: criteria.page,
+    pageLimit: criteria.pageLimit,
+    hasQuery: Boolean(criteria.query)
+  });
+
+  try {
+    const response = await axios.post(endpoint, payload, {
+      timeout: REQUEST_TIMEOUT_MS,
+      headers: {
+        Authorization: `Bearer ${criteria.apiKey}`,
+        Version: GHL_VERSION,
+        "Content-Type": "application/json"
+      }
+    });
+
+    const contacts = extractContacts(response.data);
+
+    return {
+      contacts,
+      meta: {
+        page: criteria.page,
+        pageLimit: criteria.pageLimit,
+        total: Number(response.data?.total || response.data?.meta?.total || contacts.length)
+      }
+    };
+  } catch (error) {
+    if (error.response) {
+      console.error("[get-all-contacts] GHL response error", {
+        status: error.response.status,
+        locationId: criteria.locationId,
+        message: toErrorMessage(error)
+      });
+
+      throw new GhlServiceError("Failed to fetch contacts from GHL", 502);
+    }
+
+    if (error.request) {
+      console.error("[get-all-contacts] GHL network error", {
+        locationId: criteria.locationId,
+        message: error.message
+      });
+
+      throw new GhlServiceError("Network error while contacting GHL API", 502);
+    }
+
+    console.error("[get-all-contacts] Unexpected GHL service error", {
+      locationId: criteria.locationId,
+      message: error.message
+    });
+
+    throw new GhlServiceError("Unexpected error while contacting GHL API", 500);
+  }
 }

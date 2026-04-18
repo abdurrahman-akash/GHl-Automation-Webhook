@@ -1,25 +1,73 @@
-import { normalizeText, parseFullAddress } from "../../common/utils/address.js";
-
-function normalizeInboundValue(value) {
-  const normalized = normalizeText(value);
-
-  // Ignore unresolved GHL template tokens like {{contact.phone}}
-  if (/^\{\{[^{}]+\}\}$/.test(normalized)) {
+function normalizeText(value) {
+  if (value === null || value === undefined) {
     return "";
   }
 
-  return normalized;
+  return String(value).trim();
 }
 
-function pickFirstNormalizedValue(values = []) {
-  for (const value of values) {
-    const normalized = normalizeInboundValue(value);
-    if (normalized) {
-      return normalized;
+function parseFullAddress(fullAddress) {
+  const normalized = normalizeText(fullAddress);
+  if (!normalized) {
+    return {
+      address: "",
+      city: "",
+      state: "",
+      country: "",
+      postalCode: ""
+    };
+  }
+
+  const parts = normalized.split(",").map((part) => part.trim()).filter(Boolean);
+  if (parts.length === 0) {
+    return {
+      address: "",
+      city: "",
+      state: "",
+      country: "",
+      postalCode: ""
+    };
+  }
+
+  let country = "";
+  let state = "";
+  let postalCode = "";
+
+  const lastPart = parts[parts.length - 1] || "";
+  if (/^[A-Za-z]{2,3}$/.test(lastPart)) {
+    country = lastPart.toUpperCase();
+    parts.pop();
+  }
+
+  const stateZipPart = parts[parts.length - 1] || "";
+  const stateZipMatch = stateZipPart.match(/^([A-Za-z]{2})\s+([A-Za-z0-9-]{3,10})$/);
+  if (stateZipMatch) {
+    state = stateZipMatch[1].toUpperCase();
+    postalCode = stateZipMatch[2];
+    parts.pop();
+  } else if (/^[A-Za-z]{2}$/.test(stateZipPart)) {
+    state = stateZipPart.toUpperCase();
+    parts.pop();
+  }
+
+  if (!postalCode) {
+    const possibleZip = parts[parts.length - 1] || "";
+    if (/^[A-Za-z0-9-]{3,10}$/.test(possibleZip) && /\d/.test(possibleZip)) {
+      postalCode = possibleZip;
+      parts.pop();
     }
   }
 
-  return "";
+  const city = parts.length > 0 ? parts.pop() : "";
+  const address = parts.join(", ");
+
+  return {
+    address,
+    city,
+    state,
+    country,
+    postalCode
+  };
 }
 
 export function normalizeCheckDuplicateBusinessPayload(body = {}) {
@@ -57,63 +105,10 @@ export function hasFullBusinessAddress(payload) {
 }
 
 export function normalizeCheckDuplicatePhoneEmailPayload(body = {}) {
-  const contact = body.contact || {};
-  const customData = body.customData || body.custom_data || {};
-  const customDataContact = customData.contact || {};
-
   return {
-    phone: pickFirstNormalizedValue([
-      body.phone,
-      body.number,
-      body.phoneNumber,
-      body.phone_number,
-      body.mobile,
-      body.mobileNumber,
-      body.mobile_number,
-      body.contactPhone,
-      body["contact.phone"],
-      body["contact.number"],
-      customData.phone,
-      customData.number,
-      customData.mobile,
-      customDataContact.phone,
-      customDataContact.number,
-      body.Phone,
-      contact.phone,
-      contact.number,
-      contact.phoneNumber,
-      contact.phone_number,
-      contact.mobile,
-      contact.mobileNumber,
-      contact.mobile_number
-    ]),
-    email: pickFirstNormalizedValue([
-      body.email,
-      body.emailAddress,
-      body.email_address,
-      body["contact.email"],
-      customData.email,
-      customData.emailAddress,
-      customData.email_address,
-      customDataContact.email,
-      customDataContact.emailAddress,
-      customDataContact.email_address,
-      body.Email,
-      contact.email,
-      contact.emailAddress,
-      contact.email_address
-    ]),
-    id: pickFirstNormalizedValue([
-      body.id,
-      body.contactId,
-      body.contact_id,
-      body["contact.id"],
-      customData.id,
-      customData.contactId,
-      customData.contact_id,
-      customDataContact.id,
-      contact.id
-    ])
+    phone: normalizeText(body.phone),
+    email: normalizeText(body.email),
+    id: normalizeText(body.id)
   };
 }
 
